@@ -1,0 +1,167 @@
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from netfilterqueue import NetfilterQueue
+from scapy.all import IP, TCP, UDP, raw, IPv6
+import threading
+import os
+
+# Simplified protocol mappings
+protocols = {
+    "application_layer": {
+        80: ("HTTP", "TCP"),
+        443: ("HTTPS", "TCP"),
+        53: ("DNS", "UDP"),
+        25: ("SMTP", "TCP"),
+        110: ("POP3", "TCP")
+    },
+    "transport_layer": {
+        "TCP": 0,
+        "UDP": 0,
+    },
+    "network_layer": {
+        "IPv4": 0,
+        "IPv6": 0,
+    }
+}
+
+# Packet statistics
+app_layer_stats = {v[0]: 0 for v in protocols["application_layer"].values()}
+trans_layer_stats = {k: 0 for k in protocols["transport_layer"].keys()}
+net_layer_stats = {k: 0 for k in protocols["network_layer"].keys()}
+relation_stats = {f"{app}-{trans}-{net}": 0 for app, (app, trans) in protocols["application_layer"].items() for net in protocols["network_layer"].keys()}
+total_packets = 0
+
+# Function to classify packets
+def classify_packet(packet):
+    global total_packets
+    try:
+        pkt_payload = packet.get_payload()
+        pkt_bytes = bytes(pkt_payload)
+
+        # Identify network layer type
+        if pkt_bytes.startswith(b'\x45'):  # IPv4
+            pkt = IP(pkt_bytes)
+            net_layer_stats["IPv4"] += 1
+            net_layer_type = "IPv4"
+        elif pkt_bytes.startswith(b'\x60'):  # IPv6
+            pkt = IPv6(pkt_bytes)
+            net_layer_stats["IPv6"] += 1
+            net_layer_type = "IPv6"
+        else:
+            packet.accept()
+            return
+
+        # Transport layer classification
+        if TCP in pkt:
+            trans_layer_stats["TCP"] += 1
+            dport = pkt[TCP].dport
+            sport = pkt[TCP].sport
+            app_type = protocols["application_layer"].get(dport) or protocols["application_layer"].get(sport)
+            if app_type:
+                app_layer_stats[app_type[0]] += 1
+                relation_stats[f"{app_type[0]}-{app_type[1]}-{net_layer_type}"] += 1
+        elif UDP in pkt:
+            trans_layer_stats["UDP"] += 1
+            dport = pkt[UDP].dport
+            sport = pkt[UDP].sport
+            app_type = protocols["application_layer"].get(dport) or protocols["application_layer"].get(sport)
+            if app_type:
+                app_layer_stats[app_type[0]] += 1
+                relation_stats[f"{app_type[0]}-{app_type[1]}-{net_layer_type}"] += 1
+
+        total_packets += 1
+        packet.accept()
+    except Exception as e:
+        print(f"Error processing packet: {e}")
+        packet.accept()
+
+# Function to update pie charts dynamically
+def update_pie_charts(frame):
+    if total_packets == 0:
+        return  # Skip updating if no packets are captured
+
+    # Update application layer pie chart
+    app_percentages = [v / total_packets * 100 for v in app_layer_stats.values() if v > 0]
+    axes[0].clear()
+    wedges, texts, autotexts = axes[0].pie(
+        app_percentages,
+        labels=[k for k, v in app_layer_stats.items() if v > 0],
+        autopct='%1.1f%%',
+        startangle=140,
+        textprops={'fontsize': 8}
+    )
+    axes[0].set_title("Application Layer")
+
+    # Update transport layer pie chart
+    trans_percentages = [v / total_packets * 100 for v in trans_layer_stats.values()]
+    axes[1].clear()
+    wedges, texts, autotexts = axes[1].pie(
+        trans_percentages,
+        labels=trans_layer_stats.keys(),
+        autopct='%1.1f%%',
+        startangle=140,
+        textprops={'fontsize': 8}
+    )
+    axes[1].set_title("Transport Layer")
+
+    # Update network layer pie chart
+    net_percentages = [v / total_packets * 100 for v in net_layer_stats.values()]
+    axes[2].clear()
+    wedges, texts, autotexts = axes[2].pie(
+        net_percentages,
+        labels=net_layer_stats.keys(),
+        autopct='%1.1f%%',
+        startangle=140,
+        textprops={'fontsize': 8}
+    )
+    axes[2].set_title("Network Layer")
+
+    # Update relationship pie chart
+    # Filter the relation stats to only include non-zero values
+    filtered_relation_stats = {k: v for k, v in relation_stats.items() if v > 0}
+    relation_percentages = [v / total_packets * 100 for v in filtered_relation_stats.values()]
+    relation_labels = list(filtered_relation_stats.keys())
+
+    axes[3].clear()
+    wedges, texts, autotexts = axes[3].pie(
+        relation_percentages,
+        labels=relation_labels,
+        autopct='%1.1f%%',
+        startangle=140,
+        textprops={'fontsize': 8}
+    )
+    axes[3].set_title("Application-Transport-Network Relation")
+
+    # Add protocol names and percentages on the side of the pie chart
+    for ax in axes:
+        ax.legend(loc='best', fontsize=8)
+
+    plt.tight_layout()
+
+# Set up Matplotlib figure
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+axes = axes.flatten()
+ani = FuncAnimation(fig, update_pie_charts, interval=1000)
+
+# Function to start packet capture
+def start_nfqueue():
+    nfqueue = NetfilterQueue()
+    nfqueue.bind(1, classify_packet)
+    try:
+        nfqueue.run()
+    except KeyboardInterrupt:
+        nfqueue.unbind()
+
+# Threaded version of NFQueue capture so that Matplotlib can update
+def start_nfqueue_thread():
+    nfqueue_thread = threading.Thread(target=start_nfqueue)
+    nfqueue_thread.daemon = True
+    nfqueue_thread.start()
+
+# Main execution
+if _name_ == "_main_":
+    if os.geteuid() != 0:
+        print("Please run this script as root!")
+    else:
+        start_nfqueue_thread()
+        plt.show(block=True)
